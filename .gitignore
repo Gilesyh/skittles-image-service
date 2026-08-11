@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# Images used for testing
+*.jpg
+*.jpeg
+*.png
+
+# macOS
+.DS_Store
