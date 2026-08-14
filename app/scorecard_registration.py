@@ -194,7 +194,6 @@ def register_scorecard(image, template):
 
     image_height, image_width = image.shape[:2]
 
-    # Keep coordinates within image bounds
     detected_corners_original[:, 0] = np.clip(
         detected_corners_original[:, 0],
         0,
@@ -225,6 +224,39 @@ def register_scorecard(image, template):
         else 0.0
     )
 
+    # ---------------------------------------------------------
+    # 11. Project the AWAY SCORE region from the template
+    #     into the photographed image
+    # ---------------------------------------------------------
+
+    away_score_template = np.float32([
+        [
+            template_width_small * 0.82,
+            template_height_small * 0.27
+        ],
+        [
+            template_width_small * 0.985,
+            template_height_small * 0.27
+        ],
+        [
+            template_width_small * 0.985,
+            template_height_small * 0.66
+        ],
+        [
+            template_width_small * 0.82,
+            template_height_small * 0.66
+        ]
+    ]).reshape(-1, 1, 2)
+
+    away_score_projected_small = cv2.perspectiveTransform(
+        away_score_template,
+        homography
+    ).reshape(4, 2)
+
+    away_score_projected_original = (
+        away_score_projected_small / image_scale
+    )
+
     return {
         "matches": match_count,
         "inliers": inliers,
@@ -249,6 +281,20 @@ def register_scorecard(image, template):
 
         "image_detection_scale": float(image_scale),
         "template_detection_scale": float(template_scale),
+
+        "away_score_region": {
+            "top_left":
+                away_score_projected_original[0].tolist(),
+
+            "top_right":
+                away_score_projected_original[1].tolist(),
+
+            "bottom_right":
+                away_score_projected_original[2].tolist(),
+
+            "bottom_left":
+                away_score_projected_original[3].tolist()
+        },
 
         "homography": homography
     }
