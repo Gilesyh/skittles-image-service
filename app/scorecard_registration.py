@@ -4,7 +4,8 @@ import numpy as np
 
 def register_scorecard(image, template):
     """
-    Locate the scorecard template within a photographed image.
+    Locate the scorecard template within a photographed image,
+    using a memory-conscious feature-matching approach.
 
     Parameters
     ----------
@@ -20,12 +21,55 @@ def register_scorecard(image, template):
         Registration diagnostics and detected card corners.
     """
 
-    # Convert both images to greyscale
-    image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    # ---------------------------------------------------------
+    # 1. Downscale both images for feature detection
+    # ---------------------------------------------------------
 
-    # SIFT finds distinctive visual features in both images.
-    sift = cv2.SIFT_create()
+    max_dimension = 1400
+
+    def resize_for_detection(img):
+        height, width = img.shape[:2]
+        largest = max(width, height)
+
+        if largest <= max_dimension:
+            return img.copy(), 1.0
+
+        scale = max_dimension / largest
+
+        resized = cv2.resize(
+            img,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA
+        )
+
+        return resized, scale
+
+    image_small, image_scale = resize_for_detection(image)
+    template_small, template_scale = resize_for_detection(template)
+
+    # ---------------------------------------------------------
+    # 2. Convert to greyscale
+    # ---------------------------------------------------------
+
+    image_gray = cv2.cvtColor(
+        image_small,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    template_gray = cv2.cvtColor(
+        template_small,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    # ---------------------------------------------------------
+    # 3. Detect a capped number of SIFT features
+    # ---------------------------------------------------------
+
+    sift = cv2.SIFT_create(
+        nfeatures=1200
+    )
 
     template_keypoints, template_descriptors = sift.detectAndCompute(
         template_gray,
@@ -37,11 +81,33 @@ def register_scorecard(image, template):
         None
     )
 
-    if template_descriptors is None or image_descriptors is None:
-        raise Exception("Unable to find sufficient image features.")
+    if template_descriptors is None:
+        raise Exception(
+            "Unable to find sufficient features in template."
+        )
 
-    # Match template features against features in the photograph.
-    matcher = cv2.BFMatcher()
+    if image_descriptors is None:
+        raise Exception(
+            "Unable to find sufficient features in photographed image."
+        )
+
+    # ---------------------------------------------------------
+    # 4. Use FLANN rather than brute-force matching
+    # ---------------------------------------------------------
+
+    index_params = dict(
+        algorithm=1,
+        trees=5
+    )
+
+    search_params = dict(
+        checks=50
+    )
+
+    matcher = cv2.FlannBasedMatcher(
+        index_params,
+        search_params
+    )
 
     matches = matcher.knnMatch(
         template_descriptors,
@@ -49,7 +115,10 @@ def register_scorecard(image, template):
         k=2
     )
 
-    # Lowe's ratio test removes ambiguous matches.
+    # ---------------------------------------------------------
+    # 5. Lowe ratio test
+    # ---------------------------------------------------------
+
     good_matches = []
 
     for pair in matches:
@@ -66,7 +135,10 @@ def register_scorecard(image, template):
             f"Not enough reliable template matches: {len(good_matches)}"
         )
 
-    # Coordinates of corresponding features.
+    # ---------------------------------------------------------
+    # 6. Build matched coordinate arrays
+    # ---------------------------------------------------------
+
     template_points = np.float32([
         template_keypoints[m.queryIdx].pt
         for m in good_matches
@@ -77,8 +149,10 @@ def register_scorecard(image, template):
         for m in good_matches
     ]).reshape(-1, 1, 2)
 
-    # Calculate the perspective transformation between the clean
-    # template and the photographed card.
+    # ---------------------------------------------------------
+    # 7. Estimate homography
+    # ---------------------------------------------------------
+
     homography, mask = cv2.findHomography(
         template_points,
         image_points,
@@ -87,27 +161,63 @@ def register_scorecard(image, template):
     )
 
     if homography is None:
-        raise Exception("Unable to calculate scorecard homography.")
+        raise Exception(
+            "Unable to calculate scorecard homography."
+        )
 
-    # Template dimensions
-    template_height, template_width = template_gray.shape
+    # ---------------------------------------------------------
+    # 8. Project template corners into photographed image
+    # ---------------------------------------------------------
 
-    # Four corners of the clean template.
-    template_corners = np.float32([
+    template_height_small, template_width_small = template_gray.shape
+
+    template_corners_small = np.float32([
         [0, 0],
-        [template_width - 1, 0],
-        [template_width - 1, template_height - 1],
-        [0, template_height - 1]
+        [template_width_small - 1, 0],
+        [template_width_small - 1, template_height_small - 1],
+        [0, template_height_small - 1]
     ]).reshape(-1, 1, 2)
 
-    # Project those corners into the photograph.
-    detected_corners = cv2.perspectiveTransform(
-        template_corners,
+    detected_corners_small = cv2.perspectiveTransform(
+        template_corners_small,
         homography
     ).reshape(4, 2)
 
-    inliers = int(mask.sum()) if mask is not None else 0
+    # ---------------------------------------------------------
+    # 9. Convert detected photograph coordinates back to
+    #    original image dimensions
+    # ---------------------------------------------------------
+
+    detected_corners_original = (
+        detected_corners_small / image_scale
+    )
+
+    image_height, image_width = image.shape[:2]
+
+    # Keep coordinates within image bounds
+    detected_corners_original[:, 0] = np.clip(
+        detected_corners_original[:, 0],
+        0,
+        image_width - 1
+    )
+
+    detected_corners_original[:, 1] = np.clip(
+        detected_corners_original[:, 1],
+        0,
+        image_height - 1
+    )
+
+    # ---------------------------------------------------------
+    # 10. Diagnostics
+    # ---------------------------------------------------------
+
     match_count = len(good_matches)
+
+    inliers = (
+        int(mask.sum())
+        if mask is not None
+        else 0
+    )
 
     inlier_ratio = (
         inliers / match_count
@@ -121,16 +231,24 @@ def register_scorecard(image, template):
         "inlier_ratio": float(inlier_ratio),
 
         "corners": {
-            "top_left": detected_corners[0].tolist(),
-            "top_right": detected_corners[1].tolist(),
-            "bottom_right": detected_corners[2].tolist(),
-            "bottom_left": detected_corners[3].tolist()
+            "top_left":
+                detected_corners_original[0].tolist(),
+
+            "top_right":
+                detected_corners_original[1].tolist(),
+
+            "bottom_right":
+                detected_corners_original[2].tolist(),
+
+            "bottom_left":
+                detected_corners_original[3].tolist()
         },
 
-        "template_width": int(template_width),
-        "template_height": int(template_height),
+        "image_width": int(image_width),
+        "image_height": int(image_height),
 
-        # Keep this internally for the next stage.
-        # main.py will not return it directly as JSON.
+        "image_detection_scale": float(image_scale),
+        "template_detection_scale": float(template_scale),
+
         "homography": homography
     }
