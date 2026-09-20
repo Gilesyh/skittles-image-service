@@ -5,16 +5,28 @@ import time
 
 def analyse_orientation(image):
     """
-    Estimate the rotation required to make the scorecard horizontal.
+    Analyse a scorecard image for:
 
-    Also analyse vertical scorecard ruling lines so downstream processing
-    can identify the Home/Away divider without requiring a second
-    OpenCV / Render request.
+    1. Horizontal-line orientation, used to determine the deskew angle.
+    2. Significant near-vertical line structures, which may later be used
+       by the YSSL workflow to identify the Home/Away dividing rule.
+
+    IMPORTANT:
+    ----------
+    The vertical-line analysis performed here is diagnostic/geometric only.
+
+    It does NOT assume that the image is a YSSL card.
+    It does NOT select a Home/Away split.
+    It does NOT affect the calculated rotation angle.
+
+    This means YSL cards can continue to use this endpoint solely for
+    orientation, while YSSL processing can make use of the additional
+    vertical-line information downstream.
 
     Parameters
     ----------
     image : numpy.ndarray
-        OpenCV image.
+        OpenCV BGR image.
 
     Returns
     -------
@@ -23,25 +35,35 @@ def analyse_orientation(image):
     """
 
     # =========================================================
-    # 1. EXISTING ORIENTATION / SKEW ANALYSIS
+    # BASIC IMAGE INFORMATION
     # =========================================================
 
-    # Create a copy that we'll draw our detected lines on.
+    image_height, image_width = image.shape[:2]
+
+    if image_width <= 0 or image_height <= 0:
+        raise Exception("Image has invalid dimensions.")
+
     display = image.copy()
 
-    # Convert to greyscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # =========================================================
+    # GREYSCALE + EDGE DETECTION
+    # =========================================================
 
-    image_height, image_width = gray.shape[:2]
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY
+    )
 
-    # Detect edges
     edges = cv2.Canny(
         gray,
         50,
         150
     )
 
-    # Detect line segments for orientation analysis
+    # =========================================================
+    # HOUGH LINE DETECTION
+    # =========================================================
+
     lines = cv2.HoughLinesP(
         edges,
         rho=1,
@@ -54,45 +76,80 @@ def analyse_orientation(image):
     if lines is None:
         raise Exception("No lines detected.")
 
-    angles = []
+    # =========================================================
+    # HORIZONTAL ORIENTATION ANALYSIS
+    # =========================================================
 
-    accepted = 0
-    rejected = 0
+    horizontal_angles = []
+
+    horizontal_accepted = 0
+    horizontal_rejected = 0
+
+    # =========================================================
+    # VERTICAL SEGMENT COLLECTION
+    # =========================================================
+
+    vertical_segments = []
 
     for line in lines:
 
-        # OpenCV sometimes returns [[x1,y1,x2,y2]]
-        # and sometimes [x1,y1,x2,y2]
+        # OpenCV can return either:
+        #
+        # [[x1, y1, x2, y2]]
+        #
+        # or:
+        #
+        # [x1, y1, x2, y2]
+
         if len(line) == 1:
             x1, y1, x2, y2 = line[0]
         else:
             x1, y1, x2, y2 = line
 
+        x1 = int(x1)
+        y1 = int(y1)
+        x2 = int(x2)
+        y2 = int(y2)
+
         dx = x2 - x1
         dy = y2 - y1
 
-        length = np.hypot(dx, dy)
+        length = float(
+            np.hypot(dx, dy)
+        )
 
-        angle = np.degrees(np.arctan2(dy, dx))
+        if length <= 0:
+            continue
 
-        # Convert into range -90..90
+        angle = float(
+            np.degrees(
+                np.arctan2(dy, dx)
+            )
+        )
+
+        # Convert line angle into -90..90.
         if angle > 90:
             angle -= 180
 
         if angle < -90:
             angle += 180
 
-        # Keep only long-ish horizontal lines.
-        #
-        # IMPORTANT:
-        # This is deliberately unchanged from the version that was
-        # already giving good skew results.
-        if abs(angle) < 20 and length > 150:
+        # -----------------------------------------------------
+        # HORIZONTAL LINES
+        # -----------------------------------------------------
 
-            accepted += 1
-            angles.append(angle)
+        if (
+            abs(angle) < 20
+            and length > 150
+        ):
 
-            # Draw accepted horizontal lines in green
+            horizontal_accepted += 1
+
+            horizontal_angles.append(
+                angle
+            )
+
+            # Green diagnostic line.
             cv2.line(
                 display,
                 (x1, y1),
@@ -102,149 +159,137 @@ def analyse_orientation(image):
             )
 
         else:
+            horizontal_rejected += 1
 
-            rejected += 1
+        # -----------------------------------------------------
+        # NEAR-VERTICAL LINES
+        #
+        # A perfect vertical line has an angle of +/-90 degrees.
+        #
+        # We deliberately keep this reasonably strict because
+        # handwriting and card edges can otherwise create many
+        # false candidates.
+        # -----------------------------------------------------
 
-    if len(angles) == 0:
-        raise Exception("No suitable horizontal lines found.")
-
-    angles = np.array(angles)
-
-    median_angle = float(np.median(angles))
-    mean_angle = float(np.mean(angles))
-    std = float(np.std(angles))
-
-    # Simple confidence estimate
-    confidence = max(
-        0.0,
-        min(
-            1.0,
-            1.0 - (std / 10.0)
+        vertical_deviation = abs(
+            90.0 - abs(angle)
         )
-    )
 
-    # =========================================================
-    # 2. VERTICAL RULE ANALYSIS
-    #
-    # This is a separate Hough pass over the SAME edge image.
-    #
-    # It is deliberately more permissive than the orientation pass.
-    # We want to detect fragments of vertical printed table rules,
-    # because perspective, handwriting, shadows and photography can
-    # break one physical rule into several detected segments.
-    # =========================================================
+        minimum_vertical_length = max(
+            100.0,
+            image_height * 0.12
+        )
 
-    # Scale thresholds to image size so that this behaves sensibly
-    # on differently sized photographs.
-    min_vertical_length = max(
-        35,
-        int(image_height * 0.045)
-    )
+        if (
+            vertical_deviation <= 8.0
+            and length >= minimum_vertical_length
+        ):
 
-    vertical_max_gap = max(
-        12,
-        int(image_height * 0.025)
-    )
-
-    vertical_threshold = max(
-        30,
-        int(image_height * 0.045)
-    )
-
-    vertical_lines_raw = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 360,
-        threshold=vertical_threshold,
-        minLineLength=min_vertical_length,
-        maxLineGap=vertical_max_gap
-    )
-
-    vertical_segments = []
-
-    if vertical_lines_raw is not None:
-
-        for line in vertical_lines_raw:
-
-            if len(line) == 1:
-                x1, y1, x2, y2 = line[0]
-            else:
-                x1, y1, x2, y2 = line
-
-            dx = x2 - x1
-            dy = y2 - y1
-
-            length = float(
-                np.hypot(dx, dy)
-            )
-
-            if length <= 0:
-                continue
-
-            # Angle relative to horizontal
-            angle = float(
-                np.degrees(
-                    np.arctan2(dy, dx)
-                )
-            )
-
-            # Normalise to -90..90
-            if angle > 90:
-                angle -= 180
-
-            if angle < -90:
-                angle += 180
-
-            # Distance from perfect vertical.
-            vertical_deviation = abs(
-                90.0 - abs(angle)
-            )
-
-            # Allow some perspective / residual skew.
-            #
-            # We are intentionally not demanding a perfectly vertical
-            # line here.
-            if vertical_deviation > 12.0:
-                continue
-
-            # Ensure top/bottom ordering is consistent
+            # Put top endpoint first.
             if y1 <= y2:
-                top_x = int(x1)
-                top_y = int(y1)
-                bottom_x = int(x2)
-                bottom_y = int(y2)
+                top_x = x1
+                top_y = y1
+                bottom_x = x2
+                bottom_y = y2
             else:
-                top_x = int(x2)
-                top_y = int(y2)
-                bottom_x = int(x1)
-                bottom_y = int(y1)
+                top_x = x2
+                top_y = y2
+                bottom_x = x1
+                bottom_y = y1
 
             midpoint_x = (
                 top_x + bottom_x
             ) / 2.0
 
             vertical_segments.append({
-                "top_x": top_x,
-                "top_y": top_y,
-                "bottom_x": bottom_x,
-                "bottom_y": bottom_y,
+                "midpoint_x":
+                    float(midpoint_x),
 
-                "midpoint_x": float(midpoint_x),
+                "top_x":
+                    int(top_x),
 
-                "length": float(length),
+                "top_y":
+                    int(top_y),
 
-                "angle": float(angle),
+                "bottom_x":
+                    int(bottom_x),
+
+                "bottom_y":
+                    int(bottom_y),
+
+                "length":
+                    float(length),
+
+                "angle":
+                    float(angle),
 
                 "vertical_deviation":
                     float(vertical_deviation)
             })
 
+            # Blue diagnostic line.
+            cv2.line(
+                display,
+                (top_x, top_y),
+                (bottom_x, bottom_y),
+                (255, 0, 0),
+                2
+            )
+
     # =========================================================
-    # 3. CLUSTER VERTICAL SEGMENTS BY X POSITION
+    # CALCULATE ORIENTATION
+    # =========================================================
+
+    if len(horizontal_angles) == 0:
+        raise Exception(
+            "No suitable horizontal lines found."
+        )
+
+    horizontal_angles_array = np.array(
+        horizontal_angles,
+        dtype=np.float32
+    )
+
+    median_angle = float(
+        np.median(
+            horizontal_angles_array
+        )
+    )
+
+    mean_angle = float(
+        np.mean(
+            horizontal_angles_array
+        )
+    )
+
+    standard_deviation = float(
+        np.std(
+            horizontal_angles_array
+        )
+    )
+
+    confidence = max(
+        0.0,
+        min(
+            1.0,
+            1.0 - (
+                standard_deviation / 10.0
+            )
+        )
+    )
+
+    # =========================================================
+    # CLUSTER VERTICAL SEGMENTS BY X POSITION
+    # =========================================================
     #
-    # A single printed divider may have been detected as several
-    # pieces. We therefore group nearby X positions into one
-    # candidate physical line.
+    # HoughLinesP commonly detects both edges of the same
+    # printed vertical rule and/or detects one rule as several
+    # separate line fragments.
+    #
+    # Therefore individual segments should NOT be treated as
+    # individual card rules.
+    #
+    # We cluster nearby X positions first.
     # =========================================================
 
     cluster_tolerance = max(
@@ -252,103 +297,124 @@ def analyse_orientation(image):
         image_width * 0.008
     )
 
-    # Longest fragments first.
-    #
-    # This makes strong physical rules establish clusters before
-    # tiny fragments are considered.
     vertical_segments_sorted = sorted(
         vertical_segments,
-        key=lambda segment: segment["length"],
-        reverse=True
+        key=lambda segment:
+            segment["midpoint_x"]
     )
 
-    clusters = []
+    raw_clusters = []
 
     for segment in vertical_segments_sorted:
 
-        segment_x = segment["midpoint_x"]
+        best_cluster = None
+        best_distance = None
 
-        nearest_cluster = None
-        nearest_distance = None
+        for cluster in raw_clusters:
 
-        for cluster in clusters:
+            cluster_x = float(
+                np.average(
+                    [
+                        item["midpoint_x"]
+                        for item
+                        in cluster
+                    ],
+                    weights=[
+                        item["length"]
+                        for item
+                        in cluster
+                    ]
+                )
+            )
 
             distance = abs(
-                segment_x - cluster["x"]
+                segment["midpoint_x"]
+                - cluster_x
             )
 
             if (
                 distance <= cluster_tolerance
                 and (
-                    nearest_distance is None
-                    or distance < nearest_distance
+                    best_distance is None
+                    or distance < best_distance
                 )
             ):
-                nearest_cluster = cluster
-                nearest_distance = distance
+                best_cluster = cluster
+                best_distance = distance
 
-        if nearest_cluster is None:
-
-            clusters.append({
-                "x": float(segment_x),
-                "segments": [segment]
-            })
-
+        if best_cluster is None:
+            raw_clusters.append(
+                [segment]
+            )
         else:
-
-            nearest_cluster["segments"].append(
+            best_cluster.append(
                 segment
             )
 
-            # Recalculate cluster X using segment length as a weight.
-            total_weight = sum(
-                item["length"]
-                for item in nearest_cluster["segments"]
-            )
-
-            if total_weight > 0:
-
-                nearest_cluster["x"] = float(
-                    sum(
-                        item["midpoint_x"]
-                        * item["length"]
-                        for item
-                        in nearest_cluster["segments"]
-                    )
-                    / total_weight
-                )
-
     # =========================================================
-    # 4. BUILD CLUSTER DIAGNOSTICS
+    # SUMMARISE EACH VERTICAL CLUSTER
     # =========================================================
 
     vertical_clusters = []
 
-    for cluster in clusters:
+    for cluster in raw_clusters:
 
-        cluster_segments = cluster["segments"]
-
-        if not cluster_segments:
-            continue
-
-        top_segment = min(
-            cluster_segments,
-            key=lambda segment: segment["top_y"]
+        lengths = np.array(
+            [
+                item["length"]
+                for item
+                in cluster
+            ],
+            dtype=np.float64
         )
 
-        bottom_segment = max(
-            cluster_segments,
-            key=lambda segment: segment["bottom_y"]
+        midpoints = np.array(
+            [
+                item["midpoint_x"]
+                for item
+                in cluster
+            ],
+            dtype=np.float64
         )
 
-        top_y = min(
-            segment["top_y"]
-            for segment in cluster_segments
+        if lengths.sum() > 0:
+            cluster_x = float(
+                np.average(
+                    midpoints,
+                    weights=lengths
+                )
+            )
+        else:
+            cluster_x = float(
+                np.mean(midpoints)
+            )
+
+        top_item = min(
+            cluster,
+            key=lambda item:
+                item["top_y"]
         )
 
-        bottom_y = max(
-            segment["bottom_y"]
-            for segment in cluster_segments
+        bottom_item = max(
+            cluster,
+            key=lambda item:
+                item["bottom_y"]
+        )
+
+        top_y = int(
+            min(
+                item["top_y"]
+                for item
+                in cluster
+            )
+        )
+
+        bottom_y = int(
+            max(
+                item["bottom_y"]
+                for item
+                in cluster
+            )
         )
 
         vertical_span = max(
@@ -356,268 +422,56 @@ def analyse_orientation(image):
             bottom_y - top_y
         )
 
-        longest_segment = max(
-            segment["length"]
-            for segment in cluster_segments
+        longest_segment = float(
+            max(
+                item["length"]
+                for item
+                in cluster
+            )
         )
 
-        total_detected_length = sum(
-            segment["length"]
-            for segment in cluster_segments
+        total_detected_length = float(
+            sum(
+                item["length"]
+                for item
+                in cluster
+            )
         )
-
-        x = float(cluster["x"])
 
         x_fraction = (
-            x / image_width
-            if image_width > 0
-            else 0.0
+            cluster_x / image_width
         )
 
         vertical_span_fraction = (
             vertical_span / image_height
-            if image_height > 0
-            else 0.0
         )
 
         longest_segment_fraction = (
             longest_segment / image_height
-            if image_height > 0
-            else 0.0
         )
 
-        # A deliberately broad corridor.
+        # This is deliberately only a broad diagnostic corridor.
         #
-        # This does NOT decide that a line is the divider.
-        # It simply tells downstream code which detected rules are
-        # plausibly in the middle region of the photographed card.
+        # It MUST NOT be interpreted as:
+        # "this is the Home/Away divider".
+        #
+        # The scorecard itself may not be centred in the photo.
         in_central_corridor = (
             0.30 <= x_fraction <= 0.70
         )
 
-        # -----------------------------------------------------
-        # Coverage analysis
-        #
-        # Merge overlapping Y intervals. This is important because
-        # one printed vertical rule may appear as many fragments.
-        # Simply summing their lengths would double-count overlaps.
-        # -----------------------------------------------------
-
-        intervals = sorted(
-            [
-                (
-                    int(segment["top_y"]),
-                    int(segment["bottom_y"])
-                )
-                for segment in cluster_segments
-            ],
-            key=lambda interval: interval[0]
-        )
-
-        merged_intervals = []
-
-        for start_y, end_y in intervals:
-
-            if not merged_intervals:
-
-                merged_intervals.append(
-                    [start_y, end_y]
-                )
-
-                continue
-
-            previous = merged_intervals[-1]
-
-            # Allow a modest gap between fragments of the same rule.
-            merge_gap = max(
-                8,
-                int(image_height * 0.018)
-            )
-
-            if start_y <= previous[1] + merge_gap:
-
-                previous[1] = max(
-                    previous[1],
-                    end_y
-                )
-
-            else:
-
-                merged_intervals.append(
-                    [start_y, end_y]
-                )
-
-        merged_vertical_coverage = sum(
-            max(0, end_y - start_y)
-            for start_y, end_y
-            in merged_intervals
-        )
-
-        merged_vertical_coverage_fraction = (
-            merged_vertical_coverage / image_height
-            if image_height > 0
-            else 0.0
-        )
-
-        # -----------------------------------------------------
-        # How much of the central BODY of the image is occupied?
-        #
-        # The Home/Away divider on a YSSL card should repeatedly
-        # appear through the table body rather than existing only
-        # as one isolated line fragment.
-        # -----------------------------------------------------
-
-        body_top = int(
-            image_height * 0.18
-        )
-
-        body_bottom = int(
-            image_height * 0.90
-        )
-
-        body_height = max(
-            1,
-            body_bottom - body_top
-        )
-
-        body_coverage = 0
-
-        for start_y, end_y in merged_intervals:
-
-            clipped_start = max(
-                start_y,
-                body_top
-            )
-
-            clipped_end = min(
-                end_y,
-                body_bottom
-            )
-
-            if clipped_end > clipped_start:
-
-                body_coverage += (
-                    clipped_end - clipped_start
-                )
-
-        body_coverage_fraction = (
-            body_coverage / body_height
-        )
-
-        # Count which broad vertical zones contain evidence.
-        #
-        # This gives us another way to distinguish a true structural
-        # rule from a random vertical stroke of handwriting.
-        zone_count = 6
-
-        occupied_zones = 0
-
-        for zone_index in range(zone_count):
-
-            zone_top = int(
-                body_top
-                + (
-                    body_height
-                    * zone_index
-                    / zone_count
-                )
-            )
-
-            zone_bottom = int(
-                body_top
-                + (
-                    body_height
-                    * (zone_index + 1)
-                    / zone_count
-                )
-            )
-
-            zone_has_line = False
-
-            for start_y, end_y in merged_intervals:
-
-                overlap = max(
-                    0,
-                    min(end_y, zone_bottom)
-                    - max(start_y, zone_top)
-                )
-
-                if overlap >= max(
-                    5,
-                    int(
-                        (zone_bottom - zone_top)
-                        * 0.12
-                    )
-                ):
-                    zone_has_line = True
-                    break
-
-            if zone_has_line:
-                occupied_zones += 1
-
-        zone_coverage_fraction = (
-            occupied_zones / zone_count
-        )
-
-        # -----------------------------------------------------
-        # Structural score
-        #
-        # This is diagnostic rather than a final divider decision.
-        #
-        # Downstream n8n can use the ranked candidates while we
-        # inspect real YSSL examples.
-        # -----------------------------------------------------
-
-        centre_distance = abs(
-            x_fraction - 0.5
-        )
-
-        centre_score = max(
-            0.0,
-            1.0 - (
-                centre_distance / 0.25
-            )
-        )
-
-        span_score = min(
-            1.0,
-            vertical_span_fraction / 0.55
-        )
-
-        coverage_score = min(
-            1.0,
-            body_coverage_fraction / 0.55
-        )
-
-        zone_score = min(
-            1.0,
-            zone_coverage_fraction
-        )
-
-        segment_count_score = min(
-            1.0,
-            len(cluster_segments) / 5.0
-        )
-
-        structural_score = (
-            centre_score * 0.25
-            + span_score * 0.20
-            + coverage_score * 0.30
-            + zone_score * 0.20
-            + segment_count_score * 0.05
-        )
-
         vertical_clusters.append({
-            "x": float(x),
+            "x":
+                float(cluster_x),
 
             "x_fraction":
                 float(x_fraction),
 
             "representative_top_x":
-                int(top_segment["top_x"]),
+                int(top_item["top_x"]),
 
             "representative_bottom_x":
-                int(bottom_segment["bottom_x"]),
+                int(bottom_item["bottom_x"]),
 
             "top_y":
                 int(top_y),
@@ -638,143 +492,232 @@ def analyse_orientation(image):
                 float(longest_segment_fraction),
 
             "segment_count":
-                int(len(cluster_segments)),
+                int(len(cluster)),
 
             "total_detected_length":
                 float(total_detected_length),
-
-            "merged_vertical_coverage":
-                int(merged_vertical_coverage),
-
-            "merged_vertical_coverage_fraction":
-                float(
-                    merged_vertical_coverage_fraction
-                ),
-
-            "body_coverage":
-                int(body_coverage),
-
-            "body_coverage_fraction":
-                float(body_coverage_fraction),
-
-            "occupied_body_zones":
-                int(occupied_zones),
-
-            "body_zone_count":
-                int(zone_count),
-
-            "zone_coverage_fraction":
-                float(zone_coverage_fraction),
-
-            "centre_distance_fraction":
-                float(centre_distance),
-
-            "structural_score":
-                float(structural_score),
 
             "in_central_corridor":
                 bool(in_central_corridor)
         })
 
     # =========================================================
-    # 5. SORT VERTICAL CLUSTERS
+    # SORT CLUSTERS LEFT -> RIGHT
+    # =========================================================
     #
-    # Keep all clusters in the output, but rank central structural
-    # candidates first. This makes the diagnostics much easier to
-    # interpret when testing real cards.
+    # The previous output happened to be ordered largely by
+    # strength. For structural analysis, explicit left-to-right
+    # ordering is much more useful.
     # =========================================================
 
     vertical_clusters.sort(
-        key=lambda cluster: (
-            cluster["in_central_corridor"],
-            cluster["structural_score"],
-            cluster["body_coverage_fraction"],
-            cluster["vertical_span_fraction"],
-            cluster["segment_count"]
-        ),
-        reverse=True
+        key=lambda cluster:
+            cluster["x"]
     )
 
     # =========================================================
-    # 6. PROVIDE A BEST CENTRAL CANDIDATE
-    #
-    # IMPORTANT:
-    # We are NOT yet telling n8n blindly to crop here.
-    #
-    # This exposes what OpenCV currently believes is the strongest
-    # structural candidate so we can validate it against Bell Sharks
-    # and the other YSSL cards before allowing it to control crops.
+    # ADD LEFT-TO-RIGHT INDEX
     # =========================================================
 
-    central_candidates = [
-        cluster
-        for cluster in vertical_clusters
-        if cluster["in_central_corridor"]
-    ]
-
-    best_vertical_candidate = (
-        central_candidates[0]
-        if central_candidates
-        else None
-    )
+    for index, cluster in enumerate(
+        vertical_clusters
+    ):
+        cluster["left_to_right_index"] = int(
+            index
+        )
 
     # =========================================================
-    # 7. SAVE DEBUG IMAGE
+    # ANALYSE GAPS BETWEEN VERTICAL RULES
     # =========================================================
-
-    # Draw all vertical clusters.
     #
-    # Central candidates are drawn more prominently.
-    for cluster in vertical_clusters:
+    # A YSSL card contains a structured collection of vertical
+    # rules. Their RELATIVE spacing is useful information.
+    #
+    # We therefore return the gaps between detected clusters,
+    # but we still do not decide that any particular gap/rule
+    # represents the Home/Away boundary.
+    # =========================================================
 
-        x = int(
-            round(cluster["x"])
+    vertical_cluster_gaps = []
+
+    for index in range(
+        len(vertical_clusters) - 1
+    ):
+
+        left_cluster = (
+            vertical_clusters[index]
         )
 
-        top_y = int(
-            cluster["top_y"]
+        right_cluster = (
+            vertical_clusters[index + 1]
         )
 
-        bottom_y = int(
-            cluster["bottom_y"]
+        gap = (
+            right_cluster["x"]
+            - left_cluster["x"]
         )
 
-        if cluster["in_central_corridor"]:
+        vertical_cluster_gaps.append({
+            "left_cluster_index":
+                int(index),
 
-            cv2.line(
-                display,
-                (x, top_y),
-                (x, bottom_y),
-                (255, 0, 255),
-                3
+            "right_cluster_index":
+                int(index + 1),
+
+            "left_x":
+                float(
+                    left_cluster["x"]
+                ),
+
+            "right_x":
+                float(
+                    right_cluster["x"]
+                ),
+
+            "gap":
+                float(gap),
+
+            "gap_fraction":
+                float(
+                    gap / image_width
+                )
+        })
+
+    # =========================================================
+    # BUILD POSSIBLE STRUCTURAL PAIRS
+    # =========================================================
+    #
+    # For every pair of significant vertical clusters we return:
+    #
+    # - their positions
+    # - separation
+    # - midpoint
+    # - overlap in Y
+    #
+    # This gives downstream YSSL logic enough geometry to combine
+    # with OCR landmarks without having to repeat OpenCV work.
+    # =========================================================
+
+    vertical_cluster_pairs = []
+
+    for left_index in range(
+        len(vertical_clusters)
+    ):
+
+        for right_index in range(
+            left_index + 1,
+            len(vertical_clusters)
+        ):
+
+            left_cluster = (
+                vertical_clusters[left_index]
             )
 
-        else:
-
-            cv2.line(
-                display,
-                (x, top_y),
-                (x, bottom_y),
-                (255, 255, 0),
-                1
+            right_cluster = (
+                vertical_clusters[right_index]
             )
 
-    # Draw strongest central candidate in red.
-    if best_vertical_candidate is not None:
-
-        best_x = int(
-            round(
-                best_vertical_candidate["x"]
+            separation = (
+                right_cluster["x"]
+                - left_cluster["x"]
             )
+
+            midpoint = (
+                left_cluster["x"]
+                + right_cluster["x"]
+            ) / 2.0
+
+            overlap_top = max(
+                left_cluster["top_y"],
+                right_cluster["top_y"]
+            )
+
+            overlap_bottom = min(
+                left_cluster["bottom_y"],
+                right_cluster["bottom_y"]
+            )
+
+            overlap_span = max(
+                0,
+                overlap_bottom - overlap_top
+            )
+
+            overlap_fraction = (
+                overlap_span / image_height
+            )
+
+            vertical_cluster_pairs.append({
+                "left_cluster_index":
+                    int(left_index),
+
+                "right_cluster_index":
+                    int(right_index),
+
+                "left_x":
+                    float(
+                        left_cluster["x"]
+                    ),
+
+                "right_x":
+                    float(
+                        right_cluster["x"]
+                    ),
+
+                "separation":
+                    float(separation),
+
+                "separation_fraction":
+                    float(
+                        separation / image_width
+                    ),
+
+                "midpoint_x":
+                    float(midpoint),
+
+                "midpoint_x_fraction":
+                    float(
+                        midpoint / image_width
+                    ),
+
+                "vertical_overlap":
+                    int(overlap_span),
+
+                "vertical_overlap_fraction":
+                    float(overlap_fraction)
+            })
+
+    # =========================================================
+    # IDENTIFY GEOMETRICALLY STRONG CLUSTERS
+    # =========================================================
+    #
+    # These are NOT claimed to be Home/Away dividers.
+    #
+    # They are simply clusters with enough vertical presence to
+    # be useful candidates downstream.
+    # =========================================================
+
+    strong_vertical_cluster_indices = []
+
+    for index, cluster in enumerate(
+        vertical_clusters
+    ):
+
+        strong_enough = (
+            cluster["vertical_span_fraction"]
+            >= 0.20
+            or
+            cluster["longest_segment_fraction"]
+            >= 0.20
         )
 
-        cv2.line(
-            display,
-            (best_x, 0),
-            (best_x, image_height - 1),
-            (0, 0, 255),
-            3
-        )
+        if strong_enough:
+            strong_vertical_cluster_indices.append(
+                int(index)
+            )
+
+    # =========================================================
+    # SAVE DEBUG IMAGE
+    # =========================================================
 
     filename = (
         f"debug_lines_{int(time.time())}.jpg"
@@ -786,105 +729,132 @@ def analyse_orientation(image):
     )
 
     # =========================================================
-    # 8. CONSOLE DIAGNOSTICS
+    # SERVER LOGGING
     # =========================================================
 
     print()
-    print("--------------------------------------")
-    print("Orientation analysis")
-    print("--------------------------------------")
-    print(f"Debug image : {filename}")
-    print(f"Accepted    : {accepted}")
-    print(f"Rejected    : {rejected}")
-    print(f"Median      : {median_angle:.2f}°")
-    print(f"Mean        : {mean_angle:.2f}°")
-    print(f"Std Dev     : {std:.2f}")
-    print(f"Confidence  : {confidence:.2f}")
-    print("--------------------------------------")
-    print("Vertical analysis")
-    print("--------------------------------------")
     print(
-        f"Segments     : "
+        "--------------------------------------"
+    )
+    print(
+        "Orientation analysis"
+    )
+    print(
+        "--------------------------------------"
+    )
+
+    print(
+        f"Debug image : {filename}"
+    )
+
+    print(
+        f"Image size  : "
+        f"{image_width} x {image_height}"
+    )
+
+    print(
+        f"Accepted H  : "
+        f"{horizontal_accepted}"
+    )
+
+    print(
+        f"Rejected H  : "
+        f"{horizontal_rejected}"
+    )
+
+    print(
+        f"Median      : "
+        f"{median_angle:.2f}°"
+    )
+
+    print(
+        f"Mean        : "
+        f"{mean_angle:.2f}°"
+    )
+
+    print(
+        f"Std Dev     : "
+        f"{standard_deviation:.2f}"
+    )
+
+    print(
+        f"Confidence  : "
+        f"{confidence:.2f}"
+    )
+
+    print(
+        f"Vertical seg: "
         f"{len(vertical_segments)}"
     )
+
     print(
-        f"Clusters     : "
+        f"Vertical cls: "
         f"{len(vertical_clusters)}"
     )
+
     print(
-        f"Cluster tol  : "
-        f"{cluster_tolerance:.2f}px"
+        "Vertical clusters:"
     )
 
-    if best_vertical_candidate is not None:
-
+    for index, cluster in enumerate(
+        vertical_clusters
+    ):
         print(
-            f"Best X       : "
-            f"{best_vertical_candidate['x']:.2f}"
+            f"  {index}: "
+            f"x={cluster['x']:.1f} "
+            f"({cluster['x_fraction']:.3f}), "
+            f"span={cluster['vertical_span_fraction']:.3f}, "
+            f"segments={cluster['segment_count']}"
         )
 
-        print(
-            f"Best X frac  : "
-            f"{best_vertical_candidate['x_fraction']:.4f}"
-        )
-
-        print(
-            f"Best score   : "
-            f"{best_vertical_candidate['structural_score']:.4f}"
-        )
-
-        print(
-            f"Body cover   : "
-            f"{best_vertical_candidate['body_coverage_fraction']:.4f}"
-        )
-
-        print(
-            f"Zones        : "
-            f"{best_vertical_candidate['occupied_body_zones']}"
-            f"/"
-            f"{best_vertical_candidate['body_zone_count']}"
-        )
-
-    else:
-
-        print(
-            "Best X       : none"
-        )
-
-    print("--------------------------------------")
+    print(
+        "--------------------------------------"
+    )
     print()
 
     # =========================================================
-    # 9. RETURN RESULT
+    # RETURN
     # =========================================================
 
-    result = {
+    return {
+        # -----------------------------------------------------
+        # EXISTING ORIENTATION OUTPUT
+        # -----------------------------------------------------
+
         "rotation_angle":
-            median_angle,
+            float(median_angle),
 
         "confidence":
-            confidence,
+            float(confidence),
 
         "accepted_lines":
-            accepted,
+            int(horizontal_accepted),
 
         "rejected_lines":
-            rejected,
+            int(horizontal_rejected),
 
         "median_angle":
-            median_angle,
+            float(median_angle),
 
         "mean_angle":
-            mean_angle,
+            float(mean_angle),
 
         "standard_deviation":
-            std,
+            float(standard_deviation),
+
+        # -----------------------------------------------------
+        # IMAGE DIMENSIONS USED FOR THIS ANALYSIS
+        # -----------------------------------------------------
 
         "orientation_image_width":
             int(image_width),
 
         "orientation_image_height":
             int(image_height),
+
+        # -----------------------------------------------------
+        # VERTICAL-LINE DIAGNOSTICS
+        # -----------------------------------------------------
 
         "vertical_segment_count":
             int(len(vertical_segments)),
@@ -895,28 +865,24 @@ def analyse_orientation(image):
         "vertical_cluster_tolerance":
             float(cluster_tolerance),
 
-        "vertical_detection": {
-            "threshold":
-                int(vertical_threshold),
-
-            "min_line_length":
-                int(min_vertical_length),
-
-            "max_line_gap":
-                int(vertical_max_gap),
-
-            "maximum_vertical_deviation_degrees":
-                12.0
-        },
-
         "vertical_line_clusters":
             vertical_clusters,
 
-        "best_vertical_candidate":
-            best_vertical_candidate,
+        "vertical_cluster_gaps":
+            vertical_cluster_gaps,
+
+        "vertical_cluster_pairs":
+            vertical_cluster_pairs,
+
+        "strong_vertical_cluster_indices":
+            strong_vertical_cluster_indices,
+
+        # -----------------------------------------------------
+        # DEBUG IMAGE
+        #
+        # main.py already removes this before JSON is returned.
+        # -----------------------------------------------------
 
         "display":
             display
     }
-
-    return result
